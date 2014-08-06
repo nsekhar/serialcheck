@@ -42,7 +42,7 @@ static struct argp_option options[] = {
 	{"baud",	'b', "NUM",  0, "baudrate", 0},
 	{"device",	'd', "FILE", 0, "serial node device", 0},
 	{"file",	'f', "FILE", 0, "binary file for transfers", 0},
-	{"mode",	'm', "NUM",  0, "transfer mode (0 = duplex, 1 = receive, 2 = send)", 0},
+	{"mode",	'm', "NUM",  0, "transfer mode (0 = duplex, 1 = send 2 = receive)", 0},
 	{"loops",	'l', "NUM",  0, "loops to perform (0 => wait fot CTRL-C", 0},
 	{NULL, 0, NULL, 0, NULL, 0}
 };
@@ -60,7 +60,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 		go->baudrate = 115200;
 		break;
 	case ARGP_KEY_ARG:
-		printf("WTF\n");
+		ret =  ARGP_ERR_UNKNOWN;
 		break;
 	case 'b':
 		num = strtoul(arg, &p, 0);
@@ -263,20 +263,28 @@ static void stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 	if (opts->mode == MODE_DUPLEX || opts->mode == MODE_TX_ONLY) {
 		size = write(fd, data, data_len);
 		if (size != data_len)
-			printf("Wrote only %zd instead %zd\n", size, data_len);
+			printf("Wrote only %zd instead %lu\n", size, data_len);
 	}
 
 	if (opts->mode == MODE_DUPLEX || opts->mode == MODE_RX_ONLY) {
-		size = read(fd, cmp_data, data_len);
-		if (size != data_len)
-			printf("Read only %zd instead %zd\n", size, data_len);
+		ssize_t comp = 0;
+
+		memset(cmp_data, 0, data_len);
+		do {
+			size = read(fd, cmp_data + comp, data_len - comp);
+			if (size < 0)
+				die("Read failed: %m\n");
+			comp += size;
+
+		} while (comp < data_len);
+
 		if (memcmp(data, cmp_data, data_len)) {
 			unsigned int i;
 			int found = 0;
 			unsigned int min_pos;
 			unsigned int max_pos;
 
-			for (i = 0; i < data_len; i++) {
+			for (i = 0; i < data_len && !found; i++) {
 				if (data[i] != cmp_data[i])
 					found = 1;
 			}
@@ -294,12 +302,12 @@ static void stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 			else
 				min_pos = 0;
 
-			printf("Oh oh, inconsistency at pos %d.\n", i);
+			printf("Oh oh, inconsistency at pos %d (0x%x).\n", i, i);
 
-			printf("Original sample:\n");
+			printf("\nOriginal sample:\n");
 			print_hex_dump(data + min_pos, max_pos - min_pos, min_pos);
 
-			printf("Received sample:\n");
+			printf("\nReceived sample:\n");
 			print_hex_dump(cmp_data + min_pos, max_pos - min_pos, min_pos);
 			exit(2);
 		}
@@ -348,15 +356,13 @@ int main(int argc, char *argv[])
 		die("tcgetattr() failed: %m\n");
 	memset(&new_term, 0, sizeof(new_term));
 
+	/* or c_cflag |= BOTHER and c_ospeed for any speed */
 	ret = cfsetspeed(&new_term, opts.baudrate);
 	if (ret < 0)
 		die("cfsetspeed(, %u) failed %m\n", opts.baudrate);
+	cfmakeraw(&new_term);
+	new_term.c_iflag |= CRTSCTS;
 
-	/* or c_cflag |= BOTHER and c_ospeed for any speed */
-	new_term.c_cflag |= CRTSCTS | CS8 | CLOCAL | CREAD;
-	new_term.c_iflag = IGNPAR | IGNCR;
-	new_term.c_oflag = 0;
-	new_term.c_lflag = ICANON;
 	ret = tcsetattr(fd, TCSAFLUSH, &new_term);
 	if (ret < 0)
 		die("tcsetattr failed: %m\n");
