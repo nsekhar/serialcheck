@@ -215,11 +215,13 @@ static void hex_dump_to_buffer(const void *buf, size_t len, int rowsize,
 			linebuf[lx++] = hex_asc_hi(ch);
 			linebuf[lx++] = hex_asc_lo(ch);
 			linebuf[lx++] = ' ';
+			if (j == 7)
+				linebuf[lx++] = ' ';
 		}
 		if (j)
 			lx--;
 
-		ascii_column = 3 * rowsize + 2;
+		ascii_column = 3 * rowsize + 2 + 2;
 		break;
 	}
 	if (!ascii)
@@ -239,7 +241,7 @@ static void print_hex_dump(const void *buf, size_t len, int offset)
 {
 	const uint8_t *ptr = buf;
 	int i, linelen, remaining = len;
-	unsigned char linebuf[32 * 3 + 2 + 32 + 1];
+	unsigned char linebuf[32 * 3 + 2 + 32 + 2 + 1];
 	int rowsize = 16;
 	int groupsize = 1;
 
@@ -297,17 +299,6 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 		if (ret < 0)
 			die("poll() failed: %m\n");
 
-		if (pfd.revents & POLLOUT) {
-
-			size = write(fd, data + progress_tx, data_len - progress_tx);
-			if (size < 0)
-				die("write failed\n");
-			writes++;
-			progress_tx += size;
-			if (progress_tx >= data_len)
-				wait_tx = 0;
-		}
-
 		if (pfd.revents & POLLIN) {
 
 			size = read(fd, cmp_data + progress_rx, data_len - progress_rx);
@@ -319,7 +310,18 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 				wait_rx = 0;
 		}
 
+		if (pfd.revents & POLLOUT) {
+
+			size = write(fd, data + progress_tx, data_len - progress_tx);
+			if (size < 0)
+				die("write failed\n");
+			writes++;
+			progress_tx += size;
+			if (progress_tx >= data_len)
+				wait_tx = 0;
+		}
 	} while (wait_rx || wait_tx);
+
 	printf("Needed %u reads %u writes ", reads, writes);
 	if (opts->mode & MODE_RX_ONLY && memcmp(data, cmp_data, data_len)) {
 		unsigned int i;
@@ -366,10 +368,12 @@ static void stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 	opts->cmp_buff = malloc(data_len);
 	if (!opts->cmp_buff)
 		die("Failed to malloc(%d): %m\n", data_len);
+	memset(opts->cmp_buff, 0, data_len);
+	sleep(3);
 
 	do {
-		memset(opts->cmp_buff, 0, data_len);
 		stress_test_uart_once(opts, fd, data, data_len);
+		memset(opts->cmp_buff, 0, data_len);
 		printf("loops to go: %u\n", opts->loops - loops - 1);
 	} while (++loops < opts->loops);
 	free(opts->cmp_buff);
