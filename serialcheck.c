@@ -34,7 +34,7 @@ struct g_opt {
 #define MODE_TX_ONLY	(1 << 0)
 #define MODE_RX_ONLY	(1 << 1)
 	unsigned int mode;
-	unsigned long long loops;
+	unsigned int loops;
 	unsigned char *cmp_buff;
 };
 
@@ -59,6 +59,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 	case ARGP_KEY_INIT:
 		memset(go, 0, sizeof(*go));
 		go->baudrate = 115200;
+		go->loops = UINT_MAX;
 		break;
 	case ARGP_KEY_ARG:
 		ret =  ARGP_ERR_UNKNOWN;
@@ -93,7 +94,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 		break;
 	case 'l':
 		num = strtoull(arg, &p, 0);
-		if (errno == ERANGE || *p != '\0') {
+		if (num >= UINT_MAX || *p != '\0') {
 			printf("Unsuported loop count: %s\n", arg);
 			ret = ARGP_ERR_UNKNOWN;
 		} else
@@ -265,6 +266,8 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 	int wait_tx;
 	ssize_t progress_rx = 0;
 	ssize_t progress_tx = 0;
+	unsigned int reads = 0;
+	unsigned int writes = 0;
 
 	do {
 		struct pollfd pfd = {
@@ -289,7 +292,7 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 		ret = poll(&pfd, 1, 10 * 1000);
 		if (ret == 0) {
 			printf("timeout, RX/TX: %ld/%ld\n", progress_rx, progress_tx);
-			exit(3);
+			break;
 		}
 		if (ret < 0)
 			die("poll() failed: %m\n");
@@ -299,6 +302,7 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 			size = write(fd, data + progress_tx, data_len - progress_tx);
 			if (size < 0)
 				die("write failed\n");
+			writes++;
 			progress_tx += size;
 			if (progress_tx >= data_len)
 				wait_tx = 0;
@@ -309,13 +313,14 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 			size = read(fd, cmp_data + progress_rx, data_len - progress_rx);
 			if (size < 0)
 				die("Read failed: %m\n");
+			reads++;
 			progress_rx += size;
 			if (progress_rx >= data_len)
 				wait_rx = 0;
 		}
 
 	} while (wait_rx || wait_tx);
-
+	printf("Needed %u reads %u writes ", reads, writes);
 	if (opts->mode & MODE_RX_ONLY && memcmp(data, cmp_data, data_len)) {
 		unsigned int i;
 		int found = 0;
@@ -323,8 +328,10 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 		unsigned int max_pos;
 
 		for (i = 0; i < data_len && !found; i++) {
-			if (data[i] != cmp_data[i])
+			if (data[i] != cmp_data[i]) {
 				found = 1;
+				break;
+			}
 		}
 
 		if (!found)
@@ -354,7 +361,7 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 static void stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 		off_t data_len)
 {
-	unsigned long long loops = opts->loops;
+	unsigned int loops = 0;
 
 	opts->cmp_buff = malloc(data_len);
 	if (!opts->cmp_buff)
@@ -363,14 +370,31 @@ static void stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 	do {
 		memset(opts->cmp_buff, 0, data_len);
 		stress_test_uart_once(opts, fd, data, data_len);
-	} while (--loops);
+		printf("loops to go: %u\n", opts->loops - loops - 1);
+	} while (++loops < opts->loops);
 	free(opts->cmp_buff);
+}
+
+struct term_params {
+	struct termios *term;
+	int fd;
+};
+
+static void set_old_term(int status, void *arg)
+{
+	struct term_params *tparams = arg;
+
+	if (status)
+		tcsetattr(tparams->fd, TCSAFLUSH, tparams->term);
 }
 
 int main(int argc, char *argv[])
 {
 	struct g_opt opts;
 	struct termios old_term, new_term;
+	struct term_params term_params = {
+		.term = &old_term,
+	};
 	struct stat data_stat;
 	int fd;
 	int ret;
@@ -405,9 +429,12 @@ int main(int argc, char *argv[])
 	fd = open(opts.uart_name, O_RDWR | O_NONBLOCK);
 	if (fd < 0)
 		die("Failed to open %s: %m\n", opts.uart_name);
+	term_params.fd = fd;
+
 	ret = tcgetattr(fd, &old_term);
 	if (ret < 0)
 		die("tcgetattr() failed: %m\n");
+
 	memset(&new_term, 0, sizeof(new_term));
 
 	/* or c_cflag |= BOTHER and c_ospeed for any speed */
@@ -415,7 +442,12 @@ int main(int argc, char *argv[])
 	if (ret < 0)
 		die("cfsetspeed(, %u) failed %m\n", opts.baudrate);
 	cfmakeraw(&new_term);
+	new_term.c_cflag |= CREAD;
 	new_term.c_iflag |= CRTSCTS;
+	new_term.c_cc[VMIN] = 64;
+	new_term.c_cc[VTIME] = 8;
+
+	on_exit(set_old_term, &term_params);
 
 	ret = tcsetattr(fd, TCSAFLUSH, &new_term);
 	if (ret < 0)
@@ -423,6 +455,10 @@ int main(int argc, char *argv[])
 	ret = tcflush(fd, TCIFLUSH);
 	if (ret < 0)
 		die("tcflush failed: %m\n");
+
+	ret = fcntl(fd, F_SETFL, 0);
+	if (ret)
+		printf("Failed to remove nonblock mode\n");
 
 	stress_test_uart(&opts, fd, data, data_len);
 
