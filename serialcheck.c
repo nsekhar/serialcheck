@@ -9,6 +9,8 @@
 #include <sys/mman.h>
 #include <stdint.h>
 #include <poll.h>
+#include <sys/ioctl.h>
+#include <linux/serial.h>
 
 #define __same_type(a, b)	__builtin_types_compatible_p(typeof(a), typeof(b))
 #define BUILD_BUG_ON_ZERO(e)	(sizeof(struct { int:-!!(e); }))
@@ -35,6 +37,7 @@ struct g_opt {
 #define MODE_RX_ONLY	(1 << 1)
 	unsigned int mode;
 	unsigned int loops;
+	unsigned char hflow;
 	unsigned char do_termios;
 	unsigned char *cmp_buff;
 };
@@ -44,6 +47,7 @@ static struct argp_option options[] = {
 	{"baud",	'b', "NUM",  0, "baudrate", 0},
 	{"device",	'd', "FILE", 0, "serial node device", 0},
 	{"file",	'f', "FILE", 0, "binary file for transfers", 0},
+	{"hflow",	'h', NULL,   0, "enable hardware flow control", 0},
 	{"mode",	'm', "M",    0, "transfer mode (d = duplex, t = send r = receive)", 0},
 	{"loops",	'l', "NUM",  0, "loops to perform (0 => wait fot CTRL-C", 0},
 	{"no-termios",	'n', NULL,   0, "No termios change (baud rate etc. remains unchanged)", 0},
@@ -82,6 +86,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 	case 'f':
 		free(go->file_trans);
 		go->file_trans = strdup(arg);
+		break;
+	case 'h':
+		go->hflow = 1;
 		break;
 	case 'm':
 		if (arg[0] == 'r')
@@ -132,6 +139,16 @@ static void die(const char *fmt, ...)
 	vprintf(fmt, ap);
 	va_end(ap);
 	exit(1);
+}
+
+static int print_ret_neg(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vprintf(fmt, ap);
+	va_end(ap);
+	return -1;
 }
 
 static int vscnprintf(char *buf, size_t size, const char *fmt, va_list args)
@@ -264,7 +281,7 @@ static void print_hex_dump(const void *buf, size_t len, int offset)
 	}
 }
 
-static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *data,
+static int stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *data,
 		off_t data_len)
 {
 	unsigned char *cmp_data = opts->cmp_buff;
@@ -298,17 +315,17 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 
 		ret = poll(&pfd, 1, 10 * 1000);
 		if (ret == 0) {
-			printf("timeout, RX/TX: %zd/%zd\n", progress_rx, progress_tx);
+			printf("\ntimeout, RX/TX: %zd/%zd\n", progress_rx, progress_tx);
 			break;
 		}
 		if (ret < 0)
-			die("poll() failed: %m\n");
+			return print_ret_neg("\npoll() failed: %m\n");
 
 		if (pfd.revents & POLLIN) {
 
 			size = read(fd, cmp_data + progress_rx, data_len - progress_rx);
 			if (size < 0)
-				die("Read failed: %m\n");
+				return print_ret_neg("\nRead failed: %m\n");
 			reads++;
 			progress_rx += size;
 			if (progress_rx >= data_len)
@@ -319,7 +336,7 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 
 			size = write(fd, data + progress_tx, data_len - progress_tx);
 			if (size < 0)
-				die("write failed\n");
+				return print_ret_neg("\nwrite failed: %m\n");
 			writes++;
 			progress_tx += size;
 			if (progress_tx >= data_len)
@@ -342,7 +359,7 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 		}
 
 		if (!found)
-			die("memcmp() didn't match but manual cmp did\n");
+			print_ret_neg("\nmemcmp() didn't match but manual cmp did\n");
 
 		max_pos = (i & ~0xfULL) + 16 * 3;
 		if (max_pos > data_len)
@@ -361,14 +378,16 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 
 		printf("\nReceived sample:\n");
 		print_hex_dump(cmp_data + min_pos, max_pos - min_pos, min_pos);
-		exit(2);
+		return -1;
 	}
+	return 0;
 }
 
-static void stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
+static int stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 		off_t data_len)
 {
 	unsigned int loops = 0;
+	int status;
 
 	opts->cmp_buff = malloc(data_len);
 	if (!opts->cmp_buff)
@@ -376,42 +395,29 @@ static void stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 	memset(opts->cmp_buff, 0, data_len);
 
 	do {
-		stress_test_uart_once(opts, fd, data, data_len);
+		status = stress_test_uart_once(opts, fd, data, data_len);
 		memset(opts->cmp_buff, 0, data_len);
-		printf("loops %u / %u\n", loops + 1, opts->loops);
-	} while (++loops < opts->loops);
+		printf("loops %u / %u%c[K\n", loops + 1, opts->loops, 27);
+		if (!status)
+			printf("%cM", 27);
+	} while (++loops < opts->loops && !status);
+	printf("\n");
 	free(opts->cmp_buff);
-}
-
-struct term_params {
-	struct termios *term;
-	int fd;
-};
-
-static void set_old_term(int status, void *arg)
-{
-	struct term_params *tparams = arg;
-	int ret;
-
-	if (!status)
-		return;
-	ret = fcntl(tparams->fd, F_SETFL, O_NONBLOCK);
-	if (ret)
-		return;
-	tcsetattr(tparams->fd, TCSAFLUSH, tparams->term);
+	return status;
 }
 
 int main(int argc, char *argv[])
 {
 	struct g_opt opts;
 	struct termios old_term, new_term;
-	struct term_params term_params = {
-		.term = &old_term,
-	};
+	struct serial_icounter_struct old_counters;
+	struct serial_icounter_struct new_counters;
 	struct stat data_stat;
 	int fd;
 	int ret;
+	int status;
 	unsigned char *data;
+	unsigned int open_mode;
 	off_t data_len;
 
 	argp_parse(&argp, argc, argv, 0, NULL, &opts);
@@ -439,10 +445,18 @@ int main(int argc, char *argv[])
 				data_len);
 	close(fd);
 
-	fd = open(opts.uart_name, O_RDWR | O_NONBLOCK);
+	if (opts.mode == MODE_TX_ONLY)
+		open_mode = O_WRONLY;
+	else if (opts.mode == MODE_RX_ONLY)
+		open_mode = O_RDONLY;
+	else if (opts.mode == MODE_DUPLEX)
+		open_mode = O_RDWR;
+	else
+		die("Unknown mode…\n");
+
+	fd = open(opts.uart_name, open_mode | O_NONBLOCK);
 	if (fd < 0)
 		die("Failed to open %s: %m\n", opts.uart_name);
-	term_params.fd = fd;
 
 	ret = tcgetattr(fd, &old_term);
 	if (ret < 0)
@@ -456,11 +470,12 @@ int main(int argc, char *argv[])
 		die("cfsetspeed(, %u) failed %m\n", opts.baudrate);
 	cfmakeraw(&new_term);
 	new_term.c_cflag |= CREAD;
-	new_term.c_iflag |= CRTSCTS;
+	if (opts.hflow)
+		new_term.c_cflag |= CRTSCTS;
+	else
+		new_term.c_cflag &= ~CRTSCTS;
 	new_term.c_cc[VMIN] = 64;
 	new_term.c_cc[VTIME] = 8;
-
-	on_exit(set_old_term, &term_params);
 
 	ret = tcsetattr(fd, TCSANOW, &new_term);
 	if (ret < 0)
@@ -476,12 +491,28 @@ int main(int argc, char *argv[])
 	if (ret)
 		printf("Failed to remove nonblock mode\n");
 
-	stress_test_uart(&opts, fd, data, data_len);
+	ret = ioctl(fd, TIOCGICOUNT, &old_counters);
 
+	status = stress_test_uart(&opts, fd, data, data_len);
+
+	if (!ret) {
+		ret = ioctl(fd, TIOCGICOUNT, &new_counters);
+		if (!ret) {
+#define CNT(x) (new_counters.x - old_counters.x)
+			printf("cts: %d dsr: %d rng: %d dcd: %d rx: %d tx: %d "
+			"frame %d ovr %d par: %d brk: %d buf_ovrr: %d\n",
+			CNT(cts), CNT(dsr), CNT(rng), CNT(dcd), CNT(rx),
+			CNT(tx), CNT(frame), CNT(overrun), CNT(parity),
+			CNT(brk), CNT(buf_overrun));
+#undef CNT
+		}
+	}
+	if (ret)
+		printf("Failed to ioctl(,TIOCGICOUNT,)\n");
 	ret = tcsetattr(fd, TCSAFLUSH, &old_term);
 	if (ret)
 		printf("tcsetattr() of old ones failed: %m\n");
 
 	close(fd);
-	return 0;
+	return status;
 }
