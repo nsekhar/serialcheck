@@ -35,6 +35,7 @@ struct g_opt {
 #define MODE_RX_ONLY	(1 << 1)
 	unsigned int mode;
 	unsigned int loops;
+	unsigned char do_termios;
 	unsigned char *cmp_buff;
 };
 
@@ -45,6 +46,7 @@ static struct argp_option options[] = {
 	{"file",	'f', "FILE", 0, "binary file for transfers", 0},
 	{"mode",	'm', "M",    0, "transfer mode (d = duplex, t = send r = receive)", 0},
 	{"loops",	'l', "NUM",  0, "loops to perform (0 => wait fot CTRL-C", 0},
+	{"no-termios",	'n', NULL,   0, "No termios change (baud rate etc. remains unchanged)", 0},
 	{NULL, 0, NULL, 0, NULL, 0}
 };
 
@@ -60,6 +62,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 		memset(go, 0, sizeof(*go));
 		go->baudrate = 115200;
 		go->loops = UINT_MAX;
+		go->do_termios = 1;
 		break;
 	case ARGP_KEY_ARG:
 		ret =  ARGP_ERR_UNKNOWN;
@@ -92,6 +95,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 			ret = ARGP_ERR_UNKNOWN;
 		}
 		break;
+	case 'n':
+		go->do_termios = 0;
+		break;
 	case 'l':
 		num = strtoull(arg, &p, 0);
 		if (num >= UINT_MAX || *p != '\0') {
@@ -109,7 +115,6 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 static struct argp argp = {
 	.options = options,
 	.parser = parse_opt,
-//	.args_doc = "[cfg_file]",
 	.doc = "user stress testing tool",
 };
 
@@ -293,7 +298,7 @@ static void stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *dat
 
 		ret = poll(&pfd, 1, 10 * 1000);
 		if (ret == 0) {
-			printf("timeout, RX/TX: %ld/%ld\n", progress_rx, progress_tx);
+			printf("timeout, RX/TX: %zd/%zd\n", progress_rx, progress_tx);
 			break;
 		}
 		if (ret < 0)
@@ -369,12 +374,11 @@ static void stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 	if (!opts->cmp_buff)
 		die("Failed to malloc(%d): %m\n", data_len);
 	memset(opts->cmp_buff, 0, data_len);
-	sleep(3);
 
 	do {
 		stress_test_uart_once(opts, fd, data, data_len);
 		memset(opts->cmp_buff, 0, data_len);
-		printf("loops to go: %u\n", opts->loops - loops - 1);
+		printf("loops %u / %u\n", loops + 1, opts->loops);
 	} while (++loops < opts->loops);
 	free(opts->cmp_buff);
 }
@@ -387,9 +391,14 @@ struct term_params {
 static void set_old_term(int status, void *arg)
 {
 	struct term_params *tparams = arg;
+	int ret;
 
-	if (status)
-		tcsetattr(tparams->fd, TCSAFLUSH, tparams->term);
+	if (!status)
+		return;
+	ret = fcntl(tparams->fd, F_SETFL, O_NONBLOCK);
+	if (ret)
+		return;
+	tcsetattr(tparams->fd, TCSAFLUSH, tparams->term);
 }
 
 int main(int argc, char *argv[])
@@ -439,7 +448,7 @@ int main(int argc, char *argv[])
 	if (ret < 0)
 		die("tcgetattr() failed: %m\n");
 
-	memset(&new_term, 0, sizeof(new_term));
+	new_term = old_term;
 
 	/* or c_cflag |= BOTHER and c_ospeed for any speed */
 	ret = cfsetspeed(&new_term, opts.baudrate);
@@ -453,12 +462,15 @@ int main(int argc, char *argv[])
 
 	on_exit(set_old_term, &term_params);
 
-	ret = tcsetattr(fd, TCSAFLUSH, &new_term);
+	ret = tcsetattr(fd, TCSANOW, &new_term);
 	if (ret < 0)
 		die("tcsetattr failed: %m\n");
-	ret = tcflush(fd, TCIFLUSH);
-	if (ret < 0)
-		die("tcflush failed: %m\n");
+
+	if (opts.do_termios) {
+		ret = tcflush(fd, TCIFLUSH);
+		if (ret < 0)
+			die("tcflush failed: %m\n");
+	}
 
 	ret = fcntl(fd, F_SETFL, 0);
 	if (ret)
