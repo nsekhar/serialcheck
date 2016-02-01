@@ -14,6 +14,8 @@
 
 #include <linux/serial.h>
 
+#define TIOCM_OUT1	0x2000
+#define TIOCM_OUT2	0x4000
 #define TIOCM_LOOP	0x8000
 
 #define __same_type(a, b)	__builtin_types_compatible_p(typeof(a), typeof(b))
@@ -424,6 +426,21 @@ static int stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 	return status;
 }
 
+void set_modem(int fd, int bits, int mask)
+{
+	int status, ret;
+
+	ret = ioctl(fd, TIOCMGET, &status);
+	if (ret < 0)
+		die("mcr get failed: %m\n");
+
+	status = (status & ~mask) | (bits & mask);
+
+	ret = ioctl(fd, TIOCMSET, &status);
+	if (ret < 0)
+		die("mcr set failed: %m\n");
+}
+
 int main(int argc, char *argv[])
 {
 	struct g_opt opts;
@@ -511,24 +528,11 @@ int main(int argc, char *argv[])
 			die("tcflush failed: %m\n");
 	}
 
-	if (opts.loopback) {
-		unsigned int mcr;
-
-		ret = ioctl(fd, TIOCMGET, &mcr);
-		if (ret < 0)
-			die("mcr get failed: %m\n");
-
-		mcr |= TIOCM_LOOP;
-
-		ret = ioctl(fd, TIOCMSET, &mcr);
-		if (ret < 0)
-			die ("mcr set failed: %m\n");
-
-	}
-
 	ret = fcntl(fd, F_SETFL, 0);
 	if (ret)
 		printf("Failed to remove nonblock mode\n");
+
+	set_modem(fd, opts.loopback ? TIOCM_LOOP : 0, TIOCM_LOOP);
 
 	ret = ioctl(fd, TIOCGICOUNT, &old_counters);
 
@@ -548,6 +552,9 @@ int main(int argc, char *argv[])
 	}
 	if (ret)
 		printf("Failed to ioctl(,TIOCGICOUNT,)\n");
+
+	set_modem(fd, 0, TIOCM_LOOP);
+
 	ret = tcsetattr(fd, TCSAFLUSH, &old_term);
 	if (ret)
 		printf("tcsetattr() of old ones failed: %m\n");
