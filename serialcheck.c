@@ -452,6 +452,7 @@ int main(int argc, char *argv[])
 	int fd;
 	int ret;
 	int status;
+	int flags;
 	unsigned char *data;
 	unsigned int open_mode;
 	off_t data_len;
@@ -474,8 +475,9 @@ int main(int argc, char *argv[])
 
 	data_len = data_stat.st_size;
 
-	data = mmap(NULL, data_len, PROT_READ, MAP_SHARED | MAP_LOCKED |
-			MAP_POPULATE, fd, 0);
+	flags = MAP_SHARED | MAP_LOCKED | MAP_POPULATE;
+
+	data = mmap(NULL, data_len, PROT_READ, flags, fd, 0);
 	if (data == MAP_FAILED)
 		die("mmap() of %s size %d failed: %m\n", opts.file_trans,
 				data_len);
