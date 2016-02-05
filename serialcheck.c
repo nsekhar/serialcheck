@@ -11,6 +11,9 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <signal.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <inttypes.h>
 
 #include <linux/serial.h>
 
@@ -449,6 +452,7 @@ int main(int argc, char *argv[])
 	struct serial_icounter_struct old_counters;
 	struct serial_icounter_struct new_counters;
 	struct stat data_stat;
+	struct rlimit rlim;
 	int fd;
 	int ret;
 	int status;
@@ -475,7 +479,15 @@ int main(int argc, char *argv[])
 
 	data_len = data_stat.st_size;
 
-	flags = MAP_SHARED | MAP_LOCKED | MAP_POPULATE;
+	ret = getrlimit(RLIMIT_MEMLOCK, &rlim);
+	if (ret < 0)
+		die("getrlimit() failed: %m\n");
+
+	flags = MAP_SHARED | MAP_POPULATE;
+	if (rlim.rlim_cur < (rlim_t)data_len)
+		printf("File of %jd bytes can't be locked\n", (intmax_t)data_len);
+	else
+		flags |= MAP_LOCKED;
 
 	data = mmap(NULL, data_len, PROT_READ, flags, fd, 0);
 	if (data == MAP_FAILED)
