@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <signal.h>
+
 #include <linux/serial.h>
 
 #define TIOCM_LOOP	0x8000
@@ -29,6 +31,14 @@
 static const char hex_asc[] = "0123456789abcdef";
 #define hex_asc_lo(x)	hex_asc[((x) & 0x0f)]
 #define hex_asc_hi(x)	hex_asc[((x) & 0xf0) >> 4]
+
+volatile sig_atomic_t is_interrupted = 0;
+
+void sigint_handler(int sig)
+{
+	printf("Caught signal %d\n", sig);
+	is_interrupted = 1;
+}
 
 struct g_opt {
 	char *uart_name;
@@ -408,7 +418,7 @@ static int stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 		printf("loops %u / %u%c[K\n", loops + 1, opts->loops, 27);
 		if (!status)
 			printf("%cM", 27);
-	} while (++loops < opts->loops && !status);
+	} while (++loops < opts->loops && !status && !is_interrupted);
 	printf("\n");
 	free(opts->cmp_buff);
 	return status;
@@ -417,6 +427,7 @@ static int stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 int main(int argc, char *argv[])
 {
 	struct g_opt opts;
+	struct sigaction sigint_action;
 	struct termios old_term, new_term;
 	struct serial_icounter_struct old_counters;
 	struct serial_icounter_struct new_counters;
@@ -461,6 +472,11 @@ int main(int argc, char *argv[])
 		open_mode = O_RDWR;
 	else
 		die("Unknown mode…\n");
+
+	sigint_action.sa_handler = sigint_handler;
+	sigemptyset(&sigint_action.sa_mask);
+	sigint_action.sa_flags = 0;
+	sigaction(SIGINT, &sigint_action, NULL);
 
 	fd = open(opts.uart_name, open_mode | O_NONBLOCK);
 	if (fd < 0)
