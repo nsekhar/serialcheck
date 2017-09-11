@@ -12,6 +12,8 @@
 #include <sys/ioctl.h>
 #include <linux/serial.h>
 
+#define TIOCM_LOOP	0x8000
+
 #define __same_type(a, b)	__builtin_types_compatible_p(typeof(a), typeof(b))
 #define BUILD_BUG_ON_ZERO(e)	(sizeof(struct { int:-!!(e); }))
 #define __must_be_array(a)	BUILD_BUG_ON_ZERO(__same_type((a), &(a)[0]))
@@ -40,6 +42,7 @@ struct g_opt {
 	unsigned char hflow;
 	unsigned char do_termios;
 	unsigned char *cmp_buff;
+	unsigned char loopback;
 };
 
 /* name, key, arg, flags, doc, group */
@@ -51,6 +54,7 @@ static struct argp_option options[] = {
 	{"mode",	'm', "M",    0, "transfer mode (d = duplex, t = send r = receive)", 0},
 	{"loops",	'l', "NUM",  0, "loops to perform (0 => wait fot CTRL-C", 0},
 	{"no-termios",	'n', NULL,   0, "No termios change (baud rate etc. remains unchanged)", 0},
+	{"loopback",	'k', NULL,   0, "loopback mode", 0},
 	{NULL, 0, NULL, 0, NULL, 0}
 };
 
@@ -67,6 +71,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 		go->baudrate = 115200;
 		go->loops = UINT_MAX;
 		go->do_termios = 1;
+		go->loopback = 0;
 		break;
 	case ARGP_KEY_ARG:
 		ret =  ARGP_ERR_UNKNOWN;
@@ -112,6 +117,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 			ret = ARGP_ERR_UNKNOWN;
 		} else
 			go->loops = num;
+		break;
+	case 'k':
+		go->loopback = 1;
 		break;
 	default:
 		ret = ARGP_ERR_UNKNOWN;
@@ -485,6 +493,21 @@ int main(int argc, char *argv[])
 		ret = tcflush(fd, TCIFLUSH);
 		if (ret < 0)
 			die("tcflush failed: %m\n");
+	}
+
+	if (opts.loopback) {
+		unsigned int mcr;
+
+		ret = ioctl(fd, TIOCMGET, &mcr);
+		if (ret < 0)
+			die("mcr get failed: %m\n");
+
+		mcr |= TIOCM_LOOP;
+
+		ret = ioctl(fd, TIOCMSET, &mcr);
+		if (ret < 0)
+			die ("mcr set failed: %m\n");
+
 	}
 
 	ret = fcntl(fd, F_SETFL, 0);
