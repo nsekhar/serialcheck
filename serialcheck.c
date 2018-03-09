@@ -321,7 +321,7 @@ static int stress_test_uart_once(struct g_opt *opts, int fd, unsigned char *data
 			wait_tx = 0;
 		}
 
-		ret = poll(&pfd, 1, 10 * 1000);
+		ret = poll(&pfd, 1, 100 * 1000);
 		if (ret == 0) {
 			printf("\ntimeout, RX/TX: %zd/%zd\n", progress_rx, progress_tx);
 			break;
