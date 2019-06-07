@@ -10,8 +10,15 @@
 #include <stdint.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <inttypes.h>
+
 #include <linux/serial.h>
 
+#define TIOCM_OUT1	0x2000
+#define TIOCM_OUT2	0x4000
 #define TIOCM_LOOP	0x8000
 
 #define __same_type(a, b)	__builtin_types_compatible_p(typeof(a), typeof(b))
@@ -29,6 +36,14 @@
 static const char hex_asc[] = "0123456789abcdef";
 #define hex_asc_lo(x)	hex_asc[((x) & 0x0f)]
 #define hex_asc_hi(x)	hex_asc[((x) & 0xf0) >> 4]
+
+volatile sig_atomic_t is_interrupted = 0;
+
+void sigint_handler(int sig)
+{
+	printf("Caught signal %d\n", sig);
+	is_interrupted = 1;
+}
 
 struct g_opt {
 	char *uart_name;
@@ -408,22 +423,40 @@ static int stress_test_uart(struct g_opt *opts, int fd, unsigned char *data,
 		printf("loops %u / %u%c[K\n", loops + 1, opts->loops, 27);
 		if (!status)
 			printf("%cM", 27);
-	} while (++loops < opts->loops && !status);
+	} while (++loops < opts->loops && !status && !is_interrupted);
 	printf("\n");
 	free(opts->cmp_buff);
 	return status;
 }
 
+void set_modem(int fd, int bits, int mask)
+{
+	int status, ret;
+
+	ret = ioctl(fd, TIOCMGET, &status);
+	if (ret < 0)
+		die("mcr get failed: %m\n");
+
+	status = (status & ~mask) | (bits & mask);
+
+	ret = ioctl(fd, TIOCMSET, &status);
+	if (ret < 0)
+		die("mcr set failed: %m\n");
+}
+
 int main(int argc, char *argv[])
 {
 	struct g_opt opts;
+	struct sigaction sigint_action;
 	struct termios old_term, new_term;
 	struct serial_icounter_struct old_counters;
 	struct serial_icounter_struct new_counters;
 	struct stat data_stat;
+	struct rlimit rlim;
 	int fd;
 	int ret;
 	int status;
+	int flags;
 	unsigned char *data;
 	unsigned int open_mode;
 	off_t data_len;
@@ -446,8 +479,17 @@ int main(int argc, char *argv[])
 
 	data_len = data_stat.st_size;
 
-	data = mmap(NULL, data_len, PROT_READ, MAP_SHARED | MAP_LOCKED |
-			MAP_POPULATE, fd, 0);
+	ret = getrlimit(RLIMIT_MEMLOCK, &rlim);
+	if (ret < 0)
+		die("getrlimit() failed: %m\n");
+
+	flags = MAP_SHARED | MAP_POPULATE;
+	if (rlim.rlim_cur < (rlim_t)data_len)
+		printf("File of %jd bytes can't be locked\n", (intmax_t)data_len);
+	else
+		flags |= MAP_LOCKED;
+
+	data = mmap(NULL, data_len, PROT_READ, flags, fd, 0);
 	if (data == MAP_FAILED)
 		die("mmap() of %s size %d failed: %m\n", opts.file_trans,
 				data_len);
@@ -461,6 +503,11 @@ int main(int argc, char *argv[])
 		open_mode = O_RDWR;
 	else
 		die("Unknown mode…\n");
+
+	sigint_action.sa_handler = sigint_handler;
+	sigemptyset(&sigint_action.sa_mask);
+	sigint_action.sa_flags = 0;
+	sigaction(SIGINT, &sigint_action, NULL);
 
 	fd = open(opts.uart_name, open_mode | O_NONBLOCK);
 	if (fd < 0)
@@ -495,24 +542,11 @@ int main(int argc, char *argv[])
 			die("tcflush failed: %m\n");
 	}
 
-	if (opts.loopback) {
-		unsigned int mcr;
-
-		ret = ioctl(fd, TIOCMGET, &mcr);
-		if (ret < 0)
-			die("mcr get failed: %m\n");
-
-		mcr |= TIOCM_LOOP;
-
-		ret = ioctl(fd, TIOCMSET, &mcr);
-		if (ret < 0)
-			die ("mcr set failed: %m\n");
-
-	}
-
 	ret = fcntl(fd, F_SETFL, 0);
 	if (ret)
 		printf("Failed to remove nonblock mode\n");
+
+	set_modem(fd, opts.loopback ? TIOCM_LOOP : 0, TIOCM_LOOP);
 
 	ret = ioctl(fd, TIOCGICOUNT, &old_counters);
 
@@ -532,6 +566,9 @@ int main(int argc, char *argv[])
 	}
 	if (ret)
 		printf("Failed to ioctl(,TIOCGICOUNT,)\n");
+
+	set_modem(fd, 0, TIOCM_LOOP);
+
 	ret = tcsetattr(fd, TCSAFLUSH, &old_term);
 	if (ret)
 		printf("tcsetattr() of old ones failed: %m\n");
