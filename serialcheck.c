@@ -58,11 +58,13 @@ struct g_opt {
 	unsigned char do_termios;
 	unsigned char *cmp_buff;
 	unsigned char loopback;
+	unsigned int custom_divisor;
 };
 
 /* name, key, arg, flags, doc, group */
 static struct argp_option options[] = {
 	{"baud",	'b', "NUM",  0, "baudrate", 0},
+	{"divisor",	'c', "NUM",  0, "custom divisor", 0},
 	{"device",	'd', "FILE", 0, "serial node device", 0},
 	{"file",	'f', "FILE", 0, "binary file for transfers", 0},
 	{"hflow",	'h', NULL,   0, "enable hardware flow control", 0},
@@ -87,6 +89,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 		go->loops = UINT_MAX;
 		go->do_termios = 1;
 		go->loopback = 0;
+		go->custom_divisor = 0;
 		break;
 	case ARGP_KEY_ARG:
 		ret =  ARGP_ERR_UNKNOWN;
@@ -98,6 +101,14 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 			ret =  ARGP_ERR_UNKNOWN;
 		} else
 			go->baudrate = num;
+		break;
+	case 'c':
+		num = strtoul(arg, &p, 0);
+		if (!num || *p != '\0') {
+			printf("Invalid custom divisor: %s\n", arg);
+			ret =  ARGP_ERR_UNKNOWN;
+		} else
+			go->custom_divisor = num;
 		break;
 	case 'd':
 		free(go->uart_name);
@@ -451,6 +462,7 @@ int main(int argc, char *argv[])
 	struct termios old_term, new_term;
 	struct serial_icounter_struct old_counters;
 	struct serial_icounter_struct new_counters;
+	struct serial_struct ss;
 	struct stat data_stat;
 	struct rlimit rlim;
 	int fd;
@@ -520,9 +532,14 @@ int main(int argc, char *argv[])
 	new_term = old_term;
 
 	/* or c_cflag |= BOTHER and c_ospeed for any speed */
-	ret = cfsetspeed(&new_term, opts.baudrate);
+	if (opts.custom_divisor)
+		ret = cfsetspeed(&new_term, B38400);
+	else
+		ret = cfsetspeed(&new_term, opts.baudrate);
+
 	if (ret < 0)
 		die("cfsetspeed(, %u) failed %m\n", opts.baudrate);
+
 	cfmakeraw(&new_term);
 	new_term.c_cflag |= CREAD;
 	if (opts.hflow)
@@ -540,6 +557,24 @@ int main(int argc, char *argv[])
 		ret = tcflush(fd, TCIFLUSH);
 		if (ret < 0)
 			die("tcflush failed: %m\n");
+	}
+
+	if (ioctl(fd, TIOCGSERIAL, &ss) < 0) {
+		/* silent if not set custom divisor
+		   as some devices might not support TIOCGSERIAL */
+		if (opts.custom_divisor)
+			die("setting custom divisor failed, tiocgserial unsupported: %m\n");
+	} else {
+		if (opts.custom_divisor) {
+			ss.flags = (ss.flags & ~ASYNC_SPD_MASK) | ASYNC_SPD_CUST;
+			ss.custom_divisor = opts.custom_divisor;
+		} else if ((ss.flags & ASYNC_SPD_MASK) == ASYNC_SPD_CUST) {
+			/* clear ASYNC_SPD_CUST if set */
+			ss.flags &= ~ASYNC_SPD_MASK;
+		}
+
+		if (ioctl(fd, TIOCSSERIAL, &ss) < 0)
+			die("tiocsserial failed: %m\n");
 	}
 
 	ret = fcntl(fd, F_SETFL, 0);
